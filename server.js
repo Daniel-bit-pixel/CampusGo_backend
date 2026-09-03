@@ -31,6 +31,10 @@ if (!ADMIN_PASSWORD) {
 }
 
 // ---------------- DB pool ----------------
+// Set DB_SSL=true in your deploy environment (e.g. Render) when your
+// database requires an encrypted connection — TiDB Cloud, PlanetScale,
+// and most managed cloud MySQL providers do. Leave it unset for local
+// dev against plain MySQL/phpMyAdmin, which usually doesn't need it.
 const pool = mysql.createPool({
   host: process.env.DB_HOST || "localhost",
   port: process.env.DB_PORT || 3306,
@@ -39,6 +43,7 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME || "campusgo",
   waitForConnections: true,
   connectionLimit: 10,
+  ssl: process.env.DB_SSL === "true" ? { minVersion: "TLSv1.2", rejectUnauthorized: true } : undefined,
 });
 
 // ---------------- Admin auth (in-memory tokens) ----------------
