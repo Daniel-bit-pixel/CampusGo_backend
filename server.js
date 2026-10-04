@@ -30,11 +30,38 @@ if (!ADMIN_PASSWORD) {
   console.warn("⚠️  ADMIN_PASSWORD is not set in .env — admin login will always fail.");
 }
 
+// ---------------- Flutterwave ----------------
+// Secret key is server-side only — never expose it to the frontend.
+// Get both keys from the Flutterwave dashboard → Settings → API Keys.
+// Use TEST keys (rv_test_... / FLWSECK_TEST-...) while developing;
+// LIVE keys require your Flutterwave account to be fully verified
+// (KYC) before it can send real money via the Transfers API used in
+// the vendor payout endpoint below.
+const FLUTTERWAVE_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY;
+if (!FLUTTERWAVE_SECRET_KEY) {
+  console.warn("⚠️  FLUTTERWAVE_SECRET_KEY is not set in .env — payment verification and vendor payouts will always fail.");
+}
+const FLW_BASE = "https://api.flutterwave.com/v3";
+function flwHeaders() {
+  return { Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`, "Content-Type": "application/json" };
+}
+
+// What the platform keeps from each vendor's share, as a whole
+// percentage (10 = 10%). Configurable via .env so it's not buried in
+// code if you want to change your commission rate later.
+const PLATFORM_COMMISSION_PERCENT = Number(process.env.PLATFORM_COMMISSION_PERCENT || 10);
+
 // ---------------- DB pool ----------------
 // Set DB_SSL=true in your deploy environment (e.g. Render) when your
 // database requires an encrypted connection — TiDB Cloud, PlanetScale,
 // and most managed cloud MySQL providers do. Leave it unset for local
 // dev against plain MySQL/phpMyAdmin, which usually doesn't need it.
+//
+// rejectUnauthorized: false — still encrypted (TLS), just skips
+// certificate chain validation, which avoids a common "self-signed
+// certificate in certificate chain" error against TiDB Cloud. Fine
+// for a school project; see setup-database.js's comment for the more
+// correct fix (pinning TiDB Cloud's actual CA cert) if you want it.
 const pool = mysql.createPool({
   host: process.env.DB_HOST || "localhost",
   port: process.env.DB_PORT || 3306,
@@ -43,7 +70,7 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME || "campusgo",
   waitForConnections: true,
   connectionLimit: 10,
-  ssl: process.env.DB_SSL === "true" ? { minVersion: "TLSv1.2", rejectUnauthorized: true } : undefined,
+  ssl: process.env.DB_SSL === "true" ? { minVersion: "TLSv1.2", rejectUnauthorized: false } : undefined,
 });
 
 // ---------------- Admin auth (in-memory tokens) ----------------
@@ -330,6 +357,21 @@ registerCrudRoutes("order_items", "order_items", [
   "order_id", "source_table", "source_id", "name", "emoji", "price", "qty",
 ]);
 
+// Generic admin access to the two payout tables — separate from the
+// dedicated /api/vendor/... routes further down, which are scoped to
+// whichever vendor sends X-Vendor-Name. This is what lets the admin
+// dashboard see every vendor's account/earnings, and manually flip
+// payout_status to 'paid' after sending money outside Flutterwave
+// (e.g. a direct bank transfer) — a live Transfers API call isn't the
+// only way a vendor can actually get paid.
+registerCrudRoutes("vendor_bank_accounts", "vendor_bank_accounts", [
+  "vendor_name", "bank_code", "bank_name", "account_number", "account_name",
+]);
+
+registerCrudRoutes("vendor_earnings", "vendor_earnings", [
+  "order_id", "vendor_name", "gross_amount", "commission_amount", "net_amount", "payout_status", "paid_at",
+]);
+
 // ================= Checkout (customer-facing) =================
 // Public — a logged-in customer isn't an admin, and doesn't need to
 // be one just to place an order. This is what actually saves an
@@ -424,7 +466,222 @@ app.get("/api/vendor/orders", requireAdmin, asyncRoute(async (req, res) => {
   res.json(orders);
 }));
 
-// ================= Health check =================
+// ================= Payments (Flutterwave) =================
+
+// Figures out which vendor owns each item in an order and splits the
+// order's total into a share per vendor, net of platform commission.
+// Called once, right after a payment is verified as successful.
+// Items with no vendor_name (unclaimed catalog entries) contribute
+// nothing to any vendor — that portion just isn't paid out to anyone.
+async function computeAndStoreVendorEarnings(orderId) {
+  const [items] = await pool.query(
+    "SELECT source_table, source_id, price, qty FROM order_items WHERE order_id = ?",
+    [orderId]
+  );
+  if (items.length === 0) return;
+
+  // Look up each item's owning vendor (batched per source table).
+  const byTable = {};
+  for (const it of items) (byTable[it.source_table] ??= []).push(it);
+
+  const vendorTotals = new Map(); // vendor_name -> gross amount owed
+  for (const [table, rows] of Object.entries(byTable)) {
+    const ids = rows.map((r) => r.source_id);
+    if (ids.length === 0) continue;
+    const [catalogRows] = await pool.query(
+      `SELECT id, vendor_name FROM ${table} WHERE id IN (${ids.map(() => "?").join(",")})`,
+      ids
+    );
+    const vendorById = new Map(catalogRows.map((r) => [r.id, r.vendor_name]));
+    for (const row of rows) {
+      const vendorName = vendorById.get(row.source_id);
+      if (!vendorName) continue; // unclaimed item — no vendor to pay
+      const amount = Number(row.price) * Number(row.qty);
+      vendorTotals.set(vendorName, (vendorTotals.get(vendorName) || 0) + amount);
+    }
+  }
+
+  for (const [vendorName, gross] of vendorTotals.entries()) {
+    const commission = Math.round(gross * (PLATFORM_COMMISSION_PERCENT / 100));
+    const net = gross - commission;
+    await pool.query(
+      "INSERT INTO vendor_earnings (order_id, vendor_name, gross_amount, commission_amount, net_amount) VALUES (?, ?, ?, ?, ?)",
+      [orderId, vendorName, gross, commission, net]
+    );
+  }
+}
+
+// Called by the customer app right after Flutterwave's checkout
+// callback fires. Never trusts the frontend's word that a payment
+// succeeded — re-verifies directly with Flutterwave using the secret
+// key, and cross-checks the amount and reference before marking
+// anything as paid.
+app.post("/api/payments/verify", asyncRoute(async (req, res) => {
+  const { order_id, transaction_id } = req.body;
+  if (!order_id || !transaction_id) {
+    return res.status(400).json({ error: "order_id and transaction_id are required" });
+  }
+
+  const [orderRows] = await pool.query("SELECT * FROM orders WHERE id = ?", [order_id]);
+  if (orderRows.length === 0) return res.status(404).json({ error: "Order not found" });
+  const order = orderRows[0];
+
+  if (order.payment_status === "paid") {
+    return res.json({ verified: true, alreadyProcessed: true, order });
+  }
+
+  const flwRes = await fetch(`${FLW_BASE}/transactions/${transaction_id}/verify`, { headers: flwHeaders() });
+  const flwData = await flwRes.json();
+
+  const tx = flwData?.data;
+  const ok =
+    flwData.status === "success" &&
+    tx?.status === "successful" &&
+    tx?.currency === "NGN" &&
+    Number(tx?.amount) >= Number(order.total) &&
+    tx?.tx_ref === order.order_code;
+
+  if (!ok) {
+    await pool.query("UPDATE orders SET payment_status = 'failed' WHERE id = ?", [order_id]);
+    return res.status(400).json({ error: "Payment could not be verified", verified: false });
+  }
+
+  await pool.query(
+    "UPDATE orders SET payment_status = 'paid', flw_transaction_id = ?, payment_ref = ? WHERE id = ?",
+    [String(transaction_id), tx.tx_ref, order_id]
+  );
+  await computeAndStoreVendorEarnings(order_id);
+
+  const [updated] = await pool.query("SELECT * FROM orders WHERE id = ?", [order_id]);
+  res.json({ verified: true, order: updated[0] });
+}));
+
+// List of Nigerian banks — proxied so the frontend never needs its
+// own Flutterwave key. Used to populate the bank dropdown in the
+// vendor app's payout-account form.
+app.get("/api/banks", asyncRoute(async (req, res) => {
+  const flwRes = await fetch(`${FLW_BASE}/banks/NG`, { headers: flwHeaders() });
+  const flwData = await flwRes.json();
+  if (flwData.status !== "success") return res.status(502).json({ error: "Couldn't fetch bank list" });
+  res.json(flwData.data);
+}));
+
+// ================= Vendor payouts =================
+
+// A vendor registers (or updates) where their earnings should be
+// sent. The account NAME is never taken from the vendor's own input
+// — it's resolved from Flutterwave against the account number + bank
+// they gave, so what's saved is a bank-confirmed real account, not
+// just whatever text they typed.
+app.post("/api/vendor/bank-account", requireAdmin, asyncRoute(async (req, res) => {
+  const vendorName = (req.headers["x-vendor-name"] || "").trim();
+  if (!vendorName) return res.status(400).json({ error: "Missing business name (X-Vendor-Name header)" });
+
+  const { bank_code, account_number } = req.body;
+  if (!bank_code || !account_number) {
+    return res.status(400).json({ error: "bank_code and account_number are required" });
+  }
+
+  const resolveRes = await fetch(`${FLW_BASE}/accounts/resolve`, {
+    method: "POST", headers: flwHeaders(),
+    body: JSON.stringify({ account_number, account_bank: bank_code }),
+  });
+  const resolveData = await resolveRes.json();
+  if (resolveData.status !== "success") {
+    return res.status(400).json({ error: "Couldn't verify that account — double check the bank and account number." });
+  }
+
+  const banksRes = await fetch(`${FLW_BASE}/banks/NG`, { headers: flwHeaders() });
+  const banksData = await banksRes.json();
+  const bank = banksData.data?.find((b) => b.code === bank_code);
+
+  await pool.query(
+    `INSERT INTO vendor_bank_accounts (vendor_name, bank_code, bank_name, account_number, account_name)
+     VALUES (?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE bank_code = VALUES(bank_code), bank_name = VALUES(bank_name),
+       account_number = VALUES(account_number), account_name = VALUES(account_name)`,
+    [vendorName, bank_code, bank?.name || "", account_number, resolveData.data.account_name]
+  );
+
+  res.json({ account_name: resolveData.data.account_name, bank_name: bank?.name || "" });
+}));
+
+app.get("/api/vendor/bank-account", requireAdmin, asyncRoute(async (req, res) => {
+  const vendorName = (req.headers["x-vendor-name"] || "").trim();
+  if (!vendorName) return res.status(400).json({ error: "Missing business name (X-Vendor-Name header)" });
+  const [rows] = await pool.query("SELECT * FROM vendor_bank_accounts WHERE vendor_name = ?", [vendorName]);
+  res.json(rows[0] || null);
+}));
+
+// A vendor's earnings summary — how much is pending, how much has
+// already been paid out, and the recent orders behind those numbers.
+app.get("/api/vendor/earnings", requireAdmin, asyncRoute(async (req, res) => {
+  const vendorName = (req.headers["x-vendor-name"] || "").trim();
+  if (!vendorName) return res.status(400).json({ error: "Missing business name (X-Vendor-Name header)" });
+
+  const [rows] = await pool.query(
+    `SELECT ve.*, o.order_code FROM vendor_earnings ve
+     JOIN orders o ON o.id = ve.order_id
+     WHERE ve.vendor_name = ? ORDER BY ve.created_at DESC LIMIT 50`,
+    [vendorName]
+  );
+  const pending = rows.filter((r) => r.payout_status === "pending").reduce((s, r) => s + r.net_amount, 0);
+  const paidOut = rows.filter((r) => r.payout_status === "paid").reduce((s, r) => s + r.net_amount, 0);
+  res.json({ pending, paidOut, entries: rows });
+}));
+
+// Actually sends a vendor their money via Flutterwave's Transfers
+// API. Deliberately admin-only: this is called with NO X-Vendor-Name
+// header (see registerCrudRoutes' comment on that convention above)
+// — a vendor's own session can never trigger a payout to themselves,
+// only an admin acting through the admin dashboard can.
+//
+// ⚠️ This moves real money once FLUTTERWAVE_SECRET_KEY is a LIVE key
+// on a KYC-verified Flutterwave account. With a TEST key it runs in
+// Flutterwave's sandbox and no real funds move.
+app.post("/api/vendor/:vendorName/payout", requireAdmin, asyncRoute(async (req, res) => {
+  if ((req.headers["x-vendor-name"] || "").trim()) {
+    return res.status(403).json({ error: "Payouts can only be triggered from the admin dashboard" });
+  }
+  const vendorName = req.params.vendorName;
+
+  const [pendingRows] = await pool.query(
+    "SELECT id, net_amount FROM vendor_earnings WHERE vendor_name = ? AND payout_status = 'pending'",
+    [vendorName]
+  );
+  if (pendingRows.length === 0) return res.status(400).json({ error: "Nothing pending for this vendor" });
+  const totalDue = pendingRows.reduce((s, r) => s + r.net_amount, 0);
+
+  const [accountRows] = await pool.query("SELECT * FROM vendor_bank_accounts WHERE vendor_name = ?", [vendorName]);
+  if (accountRows.length === 0) return res.status(400).json({ error: "This vendor hasn't registered a payout account yet" });
+  const account = accountRows[0];
+
+  const transferRes = await fetch(`${FLW_BASE}/transfers`, {
+    method: "POST", headers: flwHeaders(),
+    body: JSON.stringify({
+      account_bank: account.bank_code,
+      account_number: account.account_number,
+      amount: totalDue,
+      currency: "NGN",
+      narration: `CampusGo payout — ${vendorName}`,
+      reference: `campusgo-payout-${vendorName}-${Date.now()}`,
+    }),
+  });
+  const transferData = await transferRes.json();
+  if (transferData.status !== "success") {
+    return res.status(502).json({ error: transferData.message || "Transfer failed" });
+  }
+
+  const ids = pendingRows.map((r) => r.id);
+  await pool.query(
+    `UPDATE vendor_earnings SET payout_status = 'paid', paid_at = NOW() WHERE id IN (${ids.map(() => "?").join(",")})`,
+    ids
+  );
+
+  res.json({ paidOut: totalDue, transfer: transferData.data });
+}));
+
+
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, () => {

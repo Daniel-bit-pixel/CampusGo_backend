@@ -49,7 +49,15 @@ async function main() {
     port: Number(process.env.DB_PORT) || 4000,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
-    ssl: { minVersion: "TLSv1.2", rejectUnauthorized: true },
+    // rejectUnauthorized: false — the connection is still encrypted
+    // (TLS), this just skips validating the certificate chain, which
+    // avoids a common "self-signed certificate in certificate chain"
+    // error some networks/Node versions hit against TiDB Cloud. Fine
+    // for a school project; for anything handling sensitive data at
+    // scale, the more correct fix is pointing `ca` at TiDB Cloud's
+    // actual CA certificate file instead (downloadable from their
+    // Connect panel) and setting rejectUnauthorized back to true.
+    ssl: { minVersion: "TLSv1.2", rejectUnauthorized: false },
     multipleStatements: true, // lets us run schema.sql's many statements in one go
   });
   console.log("Connected.");
