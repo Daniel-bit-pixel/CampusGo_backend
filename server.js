@@ -339,13 +339,13 @@ app.post("/api/admin/login", (req, res) => {
 
 registerCrudRoutes("hostels", "hostels", ["name"]);
 
-registerCrudRoutes("menu_items", "menu_items", ["name", "category", "price", "emoji", "unit", "vendor_name"], { ownerField: "vendor_name" });
+registerCrudRoutes("menu_items", "menu_items", ["name", "category", "price", "emoji", "unit", "vendor_name", "image_url"], { ownerField: "vendor_name" });
 
-registerCrudRoutes("gas_items", "gas_items", ["name", "category", "price", "emoji", "unit", "vendor_name"], { ownerField: "vendor_name" });
+registerCrudRoutes("gas_items", "gas_items", ["name", "category", "price", "emoji", "unit", "vendor_name", "image_url"], { ownerField: "vendor_name" });
 
-registerCrudRoutes("laundry_items", "laundry_items", ["name", "category", "price", "emoji", "unit", "vendor_name"], { ownerField: "vendor_name" });
+registerCrudRoutes("laundry_items", "laundry_items", ["name", "category", "price", "emoji", "unit", "vendor_name", "image_url"], { ownerField: "vendor_name" });
 
-registerCrudRoutes("stationery_items", "stationery_items", ["name", "category", "price", "emoji", "unit", "vendor_name"], { ownerField: "vendor_name" });
+registerCrudRoutes("stationery_items", "stationery_items", ["name", "category", "price", "emoji", "unit", "vendor_name", "image_url"], { ownerField: "vendor_name" });
 
 registerCrudRoutes("orders", "orders", [
   "order_code", "user_id", "service", "hostel_id", "status",
@@ -588,7 +588,10 @@ app.post("/api/vendor/bank-account", requireAdmin, asyncRoute(async (req, res) =
   });
   const resolveData = await resolveRes.json();
   if (resolveData.status !== "success") {
-    return res.status(400).json({ error: "Couldn't verify that account — double check the bank and account number." });
+    console.warn("Flutterwave account resolve failed:", JSON.stringify(resolveData));
+    return res.status(400).json({
+      error: `Couldn't verify that account${resolveData.message ? ` (Flutterwave says: ${resolveData.message})` : ""}. Double check the bank and account number. Note: with TEST keys, Flutterwave only recognizes its own sample accounts, not real ones.`,
+    });
   }
 
   const banksRes = await fetch(`${FLW_BASE}/banks/NG`, { headers: flwHeaders() });
